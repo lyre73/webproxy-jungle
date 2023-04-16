@@ -1,4 +1,3 @@
-/* $begin tinymain */
 /*
  * tiny.c - A simple, iterative HTTP/1.0 Web server that uses the
  *          GET method to serve static and dynamic content.
@@ -16,6 +15,8 @@ void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg,
                  char *longmsg);
+
+void handler(int sig);
 
 // Iterative server, port is passed in the command line
 int main(int argc, char **argv) { // port is passed in command line. (argc, argv: for command line. argc is argument count, argv is argument vector)
@@ -197,10 +198,13 @@ void serve_static(int fd, char *filename, int filesize)
 
   /* Send response body to client */ // copy content to connected descriptor
   srcfd = Open(filename, O_RDONLY, 0); // open filename(for reading) and get its descriptor
-  srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0); // maps file to virtual memory area
+  // srcp = Mmap(0, filesize, PROT_READ, MAP_PRIVATE, srcfd, 0); // maps file to virtual memory area
+  srcp = Malloc(filesize); // Homework 11.9, would use as buffer
+  Rio_readn(srcfd, srcp, filesize);
   Close(srcfd); // file descriptor no longer need, !CLOSE THE FILE!
   Rio_writen(fd, srcp, filesize); // actual transfer to client. copy filesize bytes starting at srcp(requested file)
-  Munmap(srcp, filesize); // !FREE MAPPED VIRTUAL MEMORY!
+  // Munmap(srcp, filesize); // !FREE MAPPED VIRTUAL MEMORY!
+  Free(srcp); // Homework 11.9
 }
 
 /*
@@ -219,6 +223,10 @@ void get_filetype(char *filename, char *filetype)
   }
   else if (strstr(filename, ".jpg")) {
     strcpy(filetype, "image/jpg");
+  }
+  // Homework Problem 11.7
+  else if (strstr(filename, ".mp4")) {
+    strcpy(filetype, "video/mp4");
   }
   else {
     strcpy(filetype, "text/plain");
@@ -242,7 +250,7 @@ void serve_dynamic(int fd, char *filename, char *cgiargs) // serves any type of 
   if (Fork() == 0) { /* Child */ // fork new child process
     /* Real server would set all CGI vars here */
     setenv("QUERY_STRING", cgiargs, 1); // initializes QUERY_STRING environment variable(Program argument) with cgi arguments(from URI)
-    Dup2(fd, STDOUT_FILENO);  /* Redirect stdout // before null char(previously '&')t to client */
+    Dup2(fd, STDOUT_FILENO);  /* Redirect stdout // before null char(previously '&') to client */
     Execve(filename, emptylist, environ); /* Run CGI program */
   }
   Wait(NULL); /* Parent waits for and reaps child */
