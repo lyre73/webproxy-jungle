@@ -173,9 +173,13 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
   // parsing "hostname:port/url"
   // "hostname:port", url
   ptr = index(url, '/');
-  *ptr = '\0';
-  strcpy(uri, "/");
-  strcat(uri, ptr + 1);
+  if (ptr != NULL) {
+    *ptr = '\0';
+    strcpy(uri, "/");
+    strcat(uri, ptr + 1);
+  } else {
+    strcpy(uri, "/");
+  }
   // hostname, port, url
   ptr = index(url, ':');
   *ptr = '\0';
