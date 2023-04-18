@@ -164,6 +164,9 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
 {
   char *ptr;
 
+  // initialize port number for if client have not specified
+  strcpy(port, "8001");
+
   // if url contains "http://" or not, the server should keep going on
   if (!strncmp(url, "http://", 7)) {
     ptr = url + 7;
@@ -173,7 +176,7 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
   // parsing "hostname:port/url"
   // "hostname:port", url
   ptr = index(url, '/');
-  if (ptr != NULL) {
+  if (ptr != NULL) { // if have not gave /uri
     *ptr = '\0';
     strcpy(uri, "/");
     strcat(uri, ptr + 1);
@@ -182,9 +185,12 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
   }
   // hostname, port, url
   ptr = index(url, ':');
-  *ptr = '\0';
+  if (ptr != NULL) {
+    *ptr = '\0';
+    strcpy(port, ptr + 1);
+  }
   strcpy(hostname, url);
-  strcpy(port, ptr + 1);
+  
 
   return;
 }
