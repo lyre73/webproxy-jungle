@@ -23,20 +23,22 @@
 #define LRU_PRIORITY 9999  // default priority num for newly inserted cache block
 
 typedef struct Cacheblock {
-  // metadata
+  // data and metadata
+
   char data[MAX_OBJECT_SIZE], url[MAXLINE];
-  _Bool is_empty;         // used boolean(only 1 byte)
-  int delete_priority;    // lower num -> higher priority to delete
+  _Bool is_empty;         // used boolean(only 1 byte) to check, if empty: 1, else: 0
+  int LRU_priority;       // lower num -> higher priority to delete
+
+  // for synchronization
+
+  int readcnt;            // num of currently accessing readers
+  sem_t wrtmutex;         // if 0(there is a writer), blocks any access to the cache. binary semaphore
+  sem_t rdcntmutex;       // when updating rdcnt, blocks access to rdcnt. (sync readercnt between threads)
+  sem_t service_queue;    // (not strictly) ordering of requests(FIFO) -> no thread would starve. don't prefer reader nor writer
 } Cacheblock;
 
 typedef struct Cachelist {
   Cacheblock caches[MAX_OBJECT_NUMS];
-
-  // for synchronization
-  int readcnt;            // num of currently accessing readers
-  sem_t resource;         // controls access, binary semaphore(semaphore used to protect shared vars)
-  sem_t rmutex;           // sync changes(readcount) (mutex: for mutual exclusion)
-  sem_t service_queue;    // ordering of requests(FIFO)
 } Cachelist;
 
 // a global variable for the cache list
@@ -58,22 +60,28 @@ char *user_agent_key = "User-Agent";
 char *connection_key = "Connection";
 char *proxy_connection_key = "Proxy-Connection";
 
-// prototypes
+// proxy server function prototypes
+
 void *serve_proxy(int *fd);
 void make_hdrs(rio_t *rp, char* resulthdrs, char *hostname, char *uri);
 void parse_url(char *url, char *uri, char *hostname, char *port);
+
+// cache function prototypes
 
 void init_cachelist(void);
 int search_cache(char *url);
 int search_empty(void);
 void insert_cache(char *buf, char *url);
 void update_priority(int index);
-int find_LRU();
-int delete_cache();
-void reader_entry();
-void reader_exit();
-void writer_entry();
-void writer_exit();
+int find_insert_index(void);
+int delete_cache(void);
+
+// synchronization function prototypes
+
+void reader_entry(int index);
+void reader_exit(int index);
+void writer_entry(int index);
+void writer_exit(int index);
 
 // Iterative server, port is passed in the command line
 int main(int argc, char **argv) { // port is passed in command line. (argc, argv: for command line. argc is argument count, argv is argument vector)
@@ -89,6 +97,9 @@ int main(int argc, char **argv) { // port is passed in command line. (argc, argv
     exit(1);
   }
 
+  // let kernel IGNore broken PIPE SIGnal(premature socket ends)
+  Signal(SIGPIPE, SIG_IGN);
+
   // prepare(initialize) cachelist for caching
   init_cachelist();
 
@@ -98,7 +109,7 @@ int main(int argc, char **argv) { // port is passed in command line. (argc, argv
   // Infinite server loop, waiting for connection request
   while (1) {
     clientlen = sizeof(clientaddr); // = sizeof(struct sockaddr_storage);
-    connfdp = Malloc(sizeof(int));
+    connfdp = Malloc(sizeof(int));  // to send arguments to thread function for Pthread_create()
     *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen); // Accept(): wait for connection request to arrive to listenfd, fill in clientaddr(+length), and return connection descriptor
 
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0); // Getnameinfo(): from socket address structure, to host and service name strings
@@ -116,74 +127,99 @@ void *serve_proxy(int *fdp)
   char buf[MAXLINE], method[MAXLINE], url[MAXLINE], end_hostname[MAXLINE], uri[MAXLINE], version[MAXLINE], requesthdrs[MAXLINE], end_port[10];
   char cachebuf[MAX_OBJECT_SIZE];
   rio_t client_rio, end_rio;
+  ssize_t n;
+  int is_valid = 1;
 
   // Immediately detach the thread
   Pthread_detach(pthread_self());
-  // Free connfdp(only used to send connfd to serve_proxy())
+  // Free connfdp(only used to send connfd to serve_proxy()).
+  // if there's many arguments to use, this malloc way is better than making structure for arguments
   Free(fdp);
 
   // Read and parse the client's request header: method, end_hostname, end_port, uri(file path), version
   Rio_readinitb(&client_rio, connfd); // Rio_readinitb(): associates descriptor with read buffer(type rio_t) (receive buffer's address)
   if (!Rio_readlineb(&client_rio, buf, MAXLINE)) // Rio_readlineb(): (wrapper function) copy text line from read buffer, refill it whenever it becomes empty
-    return; // if no line to read(met EOF), return
+    return; // if no line left to read(met EOF), return
   printf("%s", buf); // print the text line that just read to buf
-  // parse the text line into method, url, version data
-  sscanf(buf, "%s %s %s", method, url, version);
-  // parse url into end_hostname, end_port, uri(file path)
-  parse_url(url, uri, end_hostname, end_port);
-  sprintf(url, "%s:%s%s", end_hostname, end_port, uri); // unify url format for cache metadata
+  sscanf(buf, "%s %s %s", method, url, version); // parse the text line into method, url, version data
+  parse_url(url, uri, end_hostname, end_port); // parse url into end_hostname, end_port, uri(file path)
 
-  // printf("\nfinding for %s in cache.\n", url);
-  if ((index = search_cache(url)) != -1) {
-    printf("found in cache!\n\n");
+  // for url format consistency(to be used for cache metadata)
+  sprintf(url, "%s:%s%s", end_hostname, end_port, uri);
+
+  // if method is not GET, return error msg and end connection with client
+  if (strcmp(method, "GET")) {
+    strcpy(buf,
+           "501 Not Implemented\tProxy does not implement this method.\n");
+    Rio_writen(connfd, buf, strlen(buf));
+
+    // don't forget to close open connection descriptor(proxy->client)
+    Close(connfd);
+
+    // terminal print for me
+    printf("501 Not Implemented\tProxy does not implement this method.\n\n");
+    return NULL;
+  }
+
+  if ((index = search_cache(url)) != -1) { // Cache hit: no need to connect to the end server
+    printf("----Cache hit----\n\n");
+
+    reader_entry(index);
 
     // read and ignore remaining headers
     strcpy(buf, "");
     while(strcmp(buf, "\r\n")) { // when buf == "\r\n", loop ends. ("\r\n" terminates request headers)
       Rio_readlineb(&client_rio, buf, MAXLINE);
     }
-    // give requested response in cache
-    Rio_writen(connfd, cachelist.caches[index].data,
-               strlen(cachelist.caches[index].data));
-  }
-  else {
-    printf("not found in cache\n\n");
+    
+    // send requested data in cache to client
+    Rio_writen(connfd, cachelist.caches[index].data, strlen(cachelist.caches[index].data));
+
+    reader_exit(index);
+
+  } else { // Cache miss: connect to the end server and get response (and remember to close the file descriptor!)
+    printf("----Cache miss----\n\n");
+
     // Read the given header and make new header to send
     make_hdrs(&client_rio, requesthdrs, end_hostname, uri); // read headers and make new HTTP request headers
 
     // Open connection to end server(end_hostname:end_port)
     endfd = Open_clientfd(end_hostname, end_port);
     Rio_readinitb(&end_rio, endfd);
+
     // Send HTTP request
     Rio_writen(endfd, requesthdrs, strlen(requesthdrs));
 
-    // Get result from end server
-    strcpy(buf, ""); // empty buffer
-
-    // empty cache buffer
+    // Get response from end server
+    // empty buffer and cache buffer to use
+    strcpy(buf, "");
     strcpy(cachebuf, "");
 
     // read and send the data given by chunks from end server
-    ssize_t n;
     while ((n = Rio_readnb(&end_rio, buf, MAXLINE)) > 0) {
       Rio_writen(connfd, buf, n);
-      // 캐시버퍼에 버퍼 내용 더해주는데, 만약 크기가 maxobj를 넘으면 캐시버퍼는 안쓸거임
-      if (strlen(cachebuf) <= MAX_OBJECT_SIZE) {
+      // concatnate buffer to cachebuffer, but if the size exceeds MAX_OBJECT_SIZE, we won't use it(stop )
+      if (strlen(cachebuf) + strlen(buf) <= MAX_OBJECT_SIZE && is_valid) { // PREVENT BUFFER OVERRUN!
         strcat(cachebuf, buf);
+      } else { // cachebuffer is not valid(over maximum size), update flag
+        is_valid = 0;
       }
       fwrite(buf, 1, n, stdout); // Use fwrite to correctly handle binary data in stdout
     }
-    printf("\n");
-    
-    // 캐시버퍼가 유효하면 리스트에 넣는다
-    if (strlen(cachebuf) <= MAX_OBJECT_SIZE) {
+    printf("\n"); // for readability of terminal output(for programmer(me), not client)
+
+    // closes open client descriptor(proxy->end server)
+    Close(endfd);
+
+    // if cache buffer is valid, insert it to the cache list
+    if (is_valid) {
       insert_cache(cachebuf, url);
     }
-
-    Close(endfd); // closes open client descriptor(proxy->end server)
   }
 
-  Close(connfd); // closes open connection descriptor(proxy->client)
+  // closes open connection descriptor(proxy->client)
+  Close(connfd);
+
   return NULL;
 }
 
@@ -195,11 +231,12 @@ void make_hdrs(rio_t *rp, char *resulthdrs, char *hostname, char *uri)
   // make request_hdr and host_hdr lines(have certain form)
   sprintf(request_hdr, request_hdr_format, uri);
   sprintf(host_hdr, host_hdr_format, hostname);
-  // initialize other_hdr(empty string)
+
+  // initialize(empty) other_hdr line
   strcpy(other_hdr, "");
 
   // start reading and making header lines
-  Rio_readlineb(rp, buf, MAXLINE);
+  strcpy(buf, "");
   while(strcmp(buf, "\r\n")) { // when buf == "\r\n", loop ends. ("\r\n" terminates request headers)
     Rio_readlineb(rp, buf, MAXLINE);
     if (strcmp(buf, "\r\n") != 0) {
@@ -208,7 +245,7 @@ void make_hdrs(rio_t *rp, char *resulthdrs, char *hostname, char *uri)
       } else if (strncmp(buf, user_agent_key, strlen(user_agent_key)) && // the lines premade(no need to save client's)
                  strncmp(buf, connection_key, strlen(connection_key)) &&
                  strncmp(buf, proxy_connection_key, strlen(proxy_connection_key)))
-      { // other headers should be appended not changed
+      { // other headers should be appended, without being changed
         strcat(other_hdr, buf);
       }
     }
@@ -225,7 +262,7 @@ void make_hdrs(rio_t *rp, char *resulthdrs, char *hostname, char *uri)
           other_hdr,
           end_of_hdr);
 
-  // print the header
+  // print the header(for me, not client)
   printf("Request headers:\n%s", resulthdrs);
   return;
 }
@@ -245,7 +282,7 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
   }
 
   // parsing "hostname:port/url"
-  // "hostname:port", url
+  // -> "hostname:port", url
   ptr = index(url, '/');
   if (ptr != NULL) { // if have not gave /uri
     *ptr = '\0';
@@ -254,7 +291,7 @@ void parse_url(char *url, char *uri, char *hostname, char *port)
   } else {
     strcpy(uri, "/");
   }
-  // hostname, port, url
+  // -> hostname, port, url
   ptr = index(url, ':');
   if (ptr != NULL) {
     *ptr = '\0';
@@ -272,178 +309,183 @@ void init_cachelist(void)
   // initialize cache blocks
   Cacheblock *current;
   for (int index = 0; index < MAX_OBJECT_NUMS; index++) {
-    // to readability
-    current = &cachelist.caches[index];
+    current = &cachelist.caches[index]; // for readability
 
     // initialize metadata
     strcpy(current->data, "");
     strcpy(current->url, "");
     current->is_empty = 1; // true
-    current->delete_priority = 0;
-  }
+    current->LRU_priority = 0;
 
-  // used for synchronization(list, not block)
-  cachelist.readcnt = 0; // no one reading now
-  // initialize semaphores for resource/readcount/ordering to 1
-  sem_init(&cachelist.resource, 0, 1);
-  sem_init(&cachelist.rmutex, 0, 1);
-  sem_init(&cachelist.service_queue, 0, 1);
+    // used for synchronization(list, not block)
+    current->readcnt = 0; // no one reading now
+    // initialize semaphores for resource/readcount/ordering to 1
+    sem_init(&current->wrtmutex, 0, 1);
+    sem_init(&current->rdcntmutex, 0, 1);
+    sem_init(&current->service_queue, 0, 1);
+  }
 }
 
 // search through cache list and return the index of the correct block. 0~9 if exists, -1 if not
 int search_cache(char *url)
 {
-  int index = -1;
   Cacheblock *current;
 
-  reader_entry();
-
-  for (int i = 0; i < MAX_OBJECT_NUMS; i++) {
-    current = &cachelist.caches[i];
-    if (current->is_empty == 0) {
-      if (strcmp(current->url, url) == 0) { // found same url metadata
-        index = i;
-        break;
-      }
+  // search through cache list
+  for (int index = 0; index < MAX_OBJECT_NUMS; index++) {
+    current = &cachelist.caches[index]; // for readability
+    reader_entry(index);
+    if (current->is_empty == 0 && strcmp(current->url, url) == 0) { // cache hit! return index
+      reader_exit(index); // don't forget
+      return index;
     }
+    reader_exit(index);
   }
-
-  reader_exit();
-  return index;
+  return -1; // indicates cache miss
 }
 
-// search through cache list and return the index of the empty block. 0~9 if exists, -1 if not
-int search_empty(void)
-{
-  int index = -1;
-  Cacheblock *current;
+// Not needed: just overwrite other cache!
+// // search through cache list and return the index of the empty block. 0~9 if exists, -1 if not
+// int search_empty(void)
+// {
+//   int index = -1;
+//   Cacheblock *current;
 
-  for (int i = 0; i < MAX_OBJECT_NUMS; i++) {
-    current = &cachelist.caches[i];
+//   for (int i = 0; i < MAX_OBJECT_NUMS; i++) {
+//     current = &cachelist.caches[i];
     
-    if (current->is_empty == 1) {
-      index = i;
-      break;
-    }
-  }
-  return index;
-}
+//     if (current->is_empty == 1) {
+//       index = i;
+//       break;
+//     }
+//   }
+//   return index;
+// }
 
 // insert data to cache
-// 빈 자리 있으면 리스트에 그냥 넣음, 빈 자리 없으면 제일 쓸모없는 거 먼저 지우고 넣음
 void insert_cache(char *buf, char *url)
 {
-  Cacheblock *current;
-  int index;
+  int index = find_insert_index();
+  Cacheblock *current = &cachelist.caches[index];
 
-  writer_entry();
+  writer_entry(index);
 
-  if ((index = search_empty()) == -1) {
-    delete_cache();
-    index = search_empty();
-  }
-
-  current = &cachelist.caches[index];
+  // fill the cache in(only data and metadata)
   strcpy(current->data, buf);
-  current->delete_priority = LRU_PRIORITY; // default num for newly inserted cache block
+  current->LRU_priority = LRU_PRIORITY; // default num for newly inserted cache block
   current->is_empty = 0;
   strcpy(current->url, url);
 
-  // and other blocks' priority numbers!
-  update_priority(index);
+  // and lower other blocks' priority numbers(increase delete priority)!
+  update_priority(index); // inside writer_entry and exit, and has own writer_entry and exit. but the block doesn't overlap so it's okay
 
-  writer_exit();
+  writer_exit(index);
 
   return;
 }
 
-// raise delete priority(lower priority number) except current index
+// raise delete priority(lower priority number) except current index block
+// the writing blocks do not overlap with it's caller function
 void update_priority(int index)
 {
   Cacheblock *current;
+
+  // search through cache list 
   for (int i = 0; i < MAX_OBJECT_NUMS; i++) {
-    current = &cachelist.caches[i];
-    if (current->is_empty == 0) {
-      if (i != index) {
-        current->delete_priority--;
+    current = &cachelist.caches[i]; // for readability
+    if (i != index) { // skip given index
+      writer_entry(i);
+      if (current->is_empty == 0) {
+        current->LRU_priority--;
       }
+      writer_exit(i);
     }
   }
   return;
 }
 
-// find least recently used data in cache
-int find_LRU()
+// find empty or least recently used data block to overwrite
+int find_insert_index()
 {
-  int target_index = -1; // 안 그렇겠지만 혹시 리스트가 비어 있으면
+  int target = 0; // if the list is empty(or have other errors, anyway), just remove(overwrite) cache[0]
   int min = LRU_PRIORITY;
   Cacheblock *current;
-  for (int i = 0; i < MAX_OBJECT_NUMS; i++) {
-    current = &cachelist.caches[i];
 
-    if (current->is_empty == 0) {
-      if (current->delete_priority < min) {
-        target_index = i;
-        min = current->delete_priority;
-      }
+  for (int index = 0; index < MAX_OBJECT_NUMS; index++) {
+    current = &cachelist.caches[index]; // for readability
+    reader_entry(index);
+    if (current->is_empty == 1) { // if there was empty block, just use it
+      reader_exit(index); // don't forget!
+      return index;
     }
+    if (current->LRU_priority < min) { // finding for highest priority block
+      target = index;
+      min = current->LRU_priority;
+    }
+    reader_exit(index);
   }
-  return target_index;
+  return target;
 }
 
-// delete least recently used data in cache
-int delete_cache()
-{
-  int index = find_LRU();
-  Cacheblock *current = &cachelist.caches[index];
+// Not needed: just overwrite other cache!
+// // delete least recently used data in cache
+// int delete_cache()
+// {
+//   int index = find_insert_index();
+//   Cacheblock *current = &cachelist.caches[index];
 
-  if (index == -1) { // find_LRU failed
-    return -1;
-  }
+//   if (index == -1) { // find_insert_index failed
+//     return -1;
+//   }
 
-  // initialize metadata
-  strcpy(current->data, "");
-  strcpy(current->url, "");
-  current->is_empty = 1; // true
-  current->delete_priority = 0;
+//   // initialize metadata
+//   strcpy(current->data, "");
+//   strcpy(current->url, "");
+//   current->is_empty = 1; // true
+//   current->LRU_priority = 0;
 
-  return 0;
-}
+//   return 0;
+// }
 
 // ENTRY section for readers, block cache for writers
-void reader_entry()
+void reader_entry(int index)
 {
-  sem_wait(&cachelist.service_queue); // wait in line to be serviced
-  sem_wait(&cachelist.rmutex);        // request exclusive access to readcount
-  cachelist.readcnt++;                // update count of active readers
-  if (cachelist.readcnt == 1) {       // if I am the first reader(only 1 readcnt)
-    sem_wait(&cachelist.resource);    // request resource access for readers(writers blocked)
+  Cacheblock *current = &cachelist.caches[index]; // for readability
+  P(&current->service_queue);   // wait in line to be serviced
+  P(&current->rdcntmutex);      // request exclusive access to readcount
+  current->readcnt++;           // update count of active readers
+  if (current->readcnt == 1) {  // if I am the first reader(only 1 readcnt)
+    P(&current->wrtmutex);      // writers blocked(someone is reading!)
   }
-  sem_post(&cachelist.service_queue); // let next in line be serviced
-  sem_post(&cachelist.rmutex);        // release access to readcount
+  V(&current->service_queue);   // let next in line be serviced
+  V(&current->rdcntmutex);      // release access to readcount
 }
 
 // EXIT section for readers, unblock cache
-void reader_exit()
+void reader_exit(int index)
 {
-  sem_wait(&cachelist.rmutex);        // request exclusive access to readcount
-  cachelist.readcnt--;                // update count of active readers
-  if (cachelist.readcnt == 0) {       // if there are no readers left
-    sem_post(&cachelist.resource);    // release resource access for all
+  Cacheblock *current = &cachelist.caches[index]; // for readability
+  P(&current->rdcntmutex);      // request exclusive access to readcount
+  current->readcnt--;           // update count of active readers
+  if (current->readcnt == 0) {  // if there are no readers left
+    V(&current->wrtmutex);      // release(unblock) access for all
   }
-  sem_post(&cachelist.rmutex); // release access to readcount
+  V(&current->rdcntmutex);      // release access to readcount
 }
 
 // ENTRY section for writers, block cache
-void writer_entry()
+void writer_entry(int index)
 {
-  sem_wait(&cachelist.service_queue); // wait in line to be serviced
-  sem_wait(&cachelist.resource);      // request exclusive access to resource
-  sem_post(&cachelist.service_queue); // let next in line be serviced
+  Cacheblock *current = &cachelist.caches[index]; // for readability
+  P(&current->service_queue);   // wait in line to be serviced
+  P(&current->wrtmutex);        // request exclusive access(block) to the cache
+  V(&current->service_queue);   // let next in line be serviced
 }
 
 // EXIT section for writer, unblock cache
-void writer_exit()
+void writer_exit(int index)
 {
-  sem_post(&cachelist.resource);      // release resource access for next reader/writer
+  Cacheblock *current = &cachelist.caches[index]; // just one variable, so not needed, but for consistency with other functions
+  V(&current->wrtmutex);        
+  // unblock access for next reader/writer
 }
