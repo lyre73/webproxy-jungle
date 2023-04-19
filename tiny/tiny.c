@@ -1,10 +1,3 @@
-/*
- * tiny.c - A simple, iterative HTTP/1.0 Web server that uses the
- *          GET method to serve static and dynamic content.
- *
- * Updated 11/2019 droh
- *   - Fixed sprintf() aliasing issue in serve_static(), and clienterror().
- */
 #include "csapp.h"
 
 // for homework
@@ -13,7 +6,7 @@
 // #define HW10 // Write HTML form for CGI adder. 2 text boxed, form request content using GET method
 #define HW11 // Extend Tiny to support HTTP HEAD method. Check using TELNET
 
-void doit(int fd);
+void *doit(int *fd);
 void read_requesthdrs(rio_t *rp);
 int parse_uri(char *uri, char *filename, char *cgiargs);
 void get_filetype(char *filename, char *filetype);
@@ -28,10 +21,11 @@ void serve_dynamic(int fd, char *filename, char *cgiargs);
 
 // Iterative server, port is passed in the command line
 int main(int argc, char **argv) { // port is passed in command line. (argc, argv: for command line. argc is argument count, argv is argument vector)
-  int listenfd, connfd;
+  int listenfd, *connfdp;
   char hostname[MAXLINE], port[MAXLINE];
   socklen_t clientlen;
   struct sockaddr_storage clientaddr; // Enough space for any address
+  pthread_t tid;
 
   /* Check command line args */
   if (argc != 2) { // main() needs only 1 argument(port). Check argc and if there's less or more argument(s), exit
@@ -48,28 +42,34 @@ int main(int argc, char **argv) { // port is passed in command line. (argc, argv
 
     // perform a transaction
     // Accept(): wait for connection request to arrive to listenfd, fill in clientaddr(+length), and return connection descriptor
-    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);   // line:netp:tiny:Accept
+    connfdp = Malloc(sizeof(int));
+    *connfdp = Accept(listenfd, (SA *)&clientaddr, &clientlen);   // line:netp:tiny:Accept
+
     Getnameinfo((SA *)&clientaddr, clientlen, hostname, MAXLINE, port, MAXLINE, 0); // Getnameinfo(): from socket address structure, to host and service name strings
     printf("Accepted connection from (%s, %s)\n", hostname, port); // prints domain name and port
-    doit(connfd);   // service                                  // line:netp:tiny:doit
-    Close(connfd);  // Closes pen connection descriptor        // line:netp:tiny:Close
+    Pthread_create(&tid, NULL, doit, connfdp);
   }
 }
 
 /*
  * doit - handle one HTTP request/response transaction
  */
-void doit(int fd) 
+void *doit(int *fdp) 
 {
-  int is_static;
+  int is_static, connfd = *fdp;
   struct stat sbuf;
   char buf[MAXLINE], method[MAXLINE], uri[MAXLINE], version[MAXLINE];
   char filename[MAXLINE], cgiargs[MAXLINE];
   rio_t rio;
 
+  // Immediately detach the thread
+  Pthread_detach(pthread_self());
+  // Free connfdp(only used to send connfd to serve_proxy())
+  Free(fdp);
+
   /* Read request line and headers */
   // 1) Read and parse the request line
-  Rio_readinitb(&rio, fd); // Rio_readinitb(): associates descriptor with read buffer(type rio_t) (receive buffer's address)
+  Rio_readinitb(&rio, connfd); // Rio_readinitb(): associates descriptor with read buffer(type rio_t) (receive buffer's address)
   if (!Rio_readlineb(&rio, buf, MAXLINE)) // if no line to read(met EOF) // Rio_readlineb(): (wrapper function) copy text line from read buffer, refill it whenever it becomes empty
     return;
   printf("%s", buf); // print the text line that just read
@@ -78,7 +78,7 @@ void doit(int fd)
 #ifdef HW11
   /* If client requests method other than GET and HEAD, send error message and return to main */
   if (strcasecmp(method, "GET") && strcasecmp(method, "HEAD")) {
-    clienterror(fd, method, "501", "Not Implemented",
+    clienterror(connfd, method, "501", "Not Implemented",
                 "Tiny does not implement this method");
     return;
   }
@@ -98,25 +98,26 @@ void doit(int fd)
   is_static = parse_uri(uri, filename, cgiargs);  // flag for static or dynamic content
   /* if the file does not exist, send error message */
   if (stat(filename, &sbuf) < 0) {
-    clienterror(fd, filename, "404", "Not found", "Tiny couldn't find this file");
+    clienterror(connfd, filename, "404", "Not found", "Tiny couldn't find this file");
     return;
   }
 
   if (is_static) { /* Serve static content */          
     if (!(S_ISREG(sbuf.st_mode)) || !(S_IRUSR & sbuf.st_mode)) { // verify regular file and read permission
-      clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't read the file");
+      clienterror(connfd, filename, "403", "Forbidden", "Tiny couldn't read the file");
       return;
     }
-    serve_static(fd, filename, sbuf.st_size, method); // serve static content
+    serve_static(connfd, filename, sbuf.st_size, method); // serve static content
   }
   else { /* Serve dynamic content */
     if (!(S_ISREG(sbuf.st_mode)) || !(S_IXUSR & sbuf.st_mode)) { // verify file executable
-      clienterror(fd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program");
+      clienterror(connfd, filename, "403", "Forbidden", "Tiny couldn't run the CGI program");
       return;
     }
-    serve_dynamic(fd, filename, cgiargs, method); // serve dynamic content
+    serve_dynamic(connfd, filename, cgiargs, method); // serve dynamic content
   }
   printf("\n");
+  Close(connfd);
 }
 
 /*
