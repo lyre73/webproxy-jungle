@@ -303,7 +303,7 @@ void serve_dynamic(int fd, char *filename, char *cgiargs) // serves any type of 
   // for me!
   printf("Response headers:\n");
   printf("%s", buf);
-  printf("(CGI sends the rest)\r\n\r\n");
+  printf("(CGI sends the rest)\n");
 
   if (Fork() == 0) { /* Child */ // fork new child process
     /* Real server would set all CGI vars here */
