@@ -33,6 +33,9 @@ int main(int argc, char **argv) { // port is passed in command line. (argc, argv
     exit(1);
   }
 
+  // let kernel IGNore broken PIPE SIGnal(premature socket ends)
+  Signal(SIGPIPE, SIG_IGN);
+
   // Open listening socket
   listenfd = Open_listenfd(argv[1]); // Open_listnfd(): return listeing descriptor. (argument: port( number))
 
